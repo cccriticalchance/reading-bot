@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reading Bot (Tap)</title>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<style>
+  body { font-family: sans-serif; margin: 0; padding: 12px; background: #111; color: #eee; }
+  video { width: 100%; max-height: 40vh; background: #000; border-radius: 8px; }
+  button { font-size: 16px; padding: 12px; margin: 4px 0; width: 100%; border: 0; border-radius: 8px; }
+  #status { font-size: 22px; font-weight: bold; margin: 8px 0; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  label { font-size: 13px; }
+  input { width: 100%; font-size: 16px; padding: 6px; box-sizing: border-box; }
+  pre { font-size: 11px; white-space: pre-wrap; background: #222; padding: 8px; border-radius: 6px; }
+</style>
+</head>
+<body>
+<h2>Reading Bot (Tap)</h2>
+<video id="cam" autoplay playsinline muted></video>
+<div id="status">Ready</div>
+
+<button id="btnBle">1. Connect Arduino (Bluetooth)</button>
+<button id="btnTest">Test tap</button>
+<div class="grid">
+  <button id="btnMinus">Angle -</button>
+  <button id="btnPlus">Angle +</button>
+</div>
+<button id="btnRest">Finger to rest</button>
+<button id="btnStart">2. Start reading bot</button>
+
+<h3>Settings</h3>
+<div class="grid">
+  <div><label>Words on a sparse page</label><input id="minW" type="number" value="20"></div>
+  <div><label>Words on a full page</label><input id="maxW" type="number" value="300"></div>
+  <div><label>Shortest wait (s)</label><input id="minT" type="number" value="10"></div>
+  <div><label>Longest wait (s)</label><input id="maxT" type="number" value="45"></div>
+  <div><label>Wait after tap (s)</label><input id="settle" type="number" value="2"></div>
+</div>
+<pre id="log"></pre>
+
+<script>
+const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const log = m => { $('log').textContent = m + '\n' + $('log').textContent.slice(0, 1500); };
+
+let device = null, chr = null, worker = null, running = false;
+
+if (!navigator.bluetooth) {
+  log('This browser has no Web Bluetooth. Use Chrome on Android (or Bluefy on iPhone).');
+}
+
+// ---------- Bluetooth (HM-10: service FFE0, characteristic FFE1) ----------
+async function openGatt() {
+  const server = await device.gatt.connect();
+  const svc = await server.getPrimaryService(0xFFE0);
+  chr = await svc.getCharacteristic(0xFFE1);
+  try {                                        // show the Arduino's replies in the log
+    await chr.startNotifications();
+    chr.addEventListener('characteristicvaluechanged', e =>
+      log('Arduino: ' + new TextDecoder().decode(e.target.value).trim()));
+  } catch (e) { /* replies are optional */ }
+}
+async function onDisconnected() {
+  chr = null;
+  log('Bluetooth lost, reconnecting...');
+  for (let i = 0; i < 5; i++) {
+    try { await openGatt(); log('Reconnected'); return; } catch (e) { await sleep(2000); }
+  }
+  log('Could not reconnect. Tap Connect Arduino again.');
+}
+async function connectBle() {
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      acceptAllDevices: true, optionalServices: [0xFFE0]
+    });
+    device.addEventListener('gattserverdisconnected', onDisconnected);
+    await openGatt();
+    log('Arduino connected: ' + (device.name || 'unnamed'));
+    $('status').textContent = 'Arduino connected';
+  } catch (e) { log('Bluetooth: ' + e.message); }
+}
+async function sendChar(ch) {
+  if (!chr) throw new Error('Arduino not connected');
+  const data = new TextEncoder().encode(ch);
+  if (chr.writeValueWithoutResponse) await chr.writeValueWithoutResponse(data);
+  else await chr.writeValue(data);
+}
+const sendFlip = () => sendChar('F');          // F = tap the key
+
+// ---------- Camera ----------
+async function startCam() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } },
+    audio: false
+  });
+  $('cam').srcObject = stream;
+  await $('cam').play();
+}
+function grab() {
+  const v = $('cam'), c = document.createElement('canvas');
+  c.width = v.videoWidth; c.height = v.videoHeight;
+  c.getContext('2d').drawImage(v, 0, 0);
+  return c;
+}
+
+// ---------- Measuring the page ----------
+async function countWords(canvas) {
+  const { data } = await worker.recognize(canvas);
+  const words = data.text.split(/\s+/).filter(t => (t.match(/[\p{L}\p{N}]/gu) || []).length >= 2);
+  return { n: words.length, preview: data.text.slice(0, 120).replace(/\s+/g, ' ') };
+}
+function inkPercent(canvas) {          // fallback for picture / blank pages
+  const w = 400, h = Math.round(canvas.height * w / canvas.width);
+  const s = document.createElement('canvas'); s.width = w; s.height = h;
+  const ctx = s.getContext('2d'); ctx.drawImage(canvas, 0, 0, w, h);
+  const d = ctx.getImageData(0, 0, w, h).data;
+  const g = new Uint8Array(w * h), hist = new Array(256).fill(0);
+  for (let i = 0; i < w * h; i++) {
+    const v = (d[4*i] * 0.299 + d[4*i+1] * 0.587 + d[4*i+2] * 0.114) | 0;
+    g[i] = v; hist[v]++;
+  }
+  let acc = 0, paper = 255;            // paper brightness = 90th percentile
+  for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= 0.9 * w * h) { paper = v; break; } }
+  let dark = 0;
+  for (let i = 0; i < w * h; i++) if (g[i] < paper * 0.6) dark++;
+  return 100 * dark / (w * h);
+}
+function waitSeconds(words, ink) {
+  const minW = +$('minW').value, maxW = +$('maxW').value;
+  const minT = +$('minT').value, maxT = +$('maxT').value;
+  let r = words >= 15 ? (words - minW) / (maxW - minW) : (ink - 2) / (12 - 2);
+  r = Math.max(0, Math.min(1, r));
+  return minT + r * (maxT - minT);
+}
+
+// ---------- Main loop ----------
+async function loop() {
+  while (running) {
+    const t0 = Date.now();
+    $('status').textContent = 'Reading the page...';
+    const frame = grab();
+    const ink = inkPercent(frame);
+    let words = 0, preview = '';
+    try { const r = await countWords(frame); words = r.n; preview = r.preview; }
+    catch (e) { log('OCR error: ' + e.message); }
+    const target = waitSeconds(words, ink);
+    log('words=' + words + ' ink=' + ink.toFixed(1) + '% -> wait ' + target.toFixed(0) + 's | ' + preview);
+
+    const end = t0 + target * 1000;     // OCR time counts toward the wait
+    while (running && Date.now() < end) {
+      $('status').textContent = 'Next page in ' + Math.ceil((end - Date.now()) / 1000) + ' s';
+      await sleep(250);
+    }
+    if (!running) break;
+    try { await sendFlip(); log('Tap sent'); } catch (e) { log('Tap failed: ' + e.message); }
+    $('status').textContent = 'Tapping...';
+    await sleep((+$('settle').value) * 1000);
+  }
+  $('status').textContent = 'Stopped';
+}
+
+// ---------- Buttons ----------
+$('btnBle').onclick = connectBle;
+$('btnMinus').onclick = () => sendChar('-').catch(e => log(e.message));
+$('btnPlus').onclick = () => sendChar('+').catch(e => log(e.message));
+$('btnRest').onclick = () => sendChar('r').catch(e => log(e.message));
+$('btnTest').onclick = async () => {
+  try { await sendFlip(); log('Test tap sent'); } catch (e) { log(e.message); }
+};
+$('btnStart').onclick = async () => {
+  if (running) { running = false; $('btnStart').textContent = '2. Start reading bot'; return; }
+  try {
+    $('status').textContent = 'Starting camera...';
+    await startCam();
+    if (!worker) {
+      $('status').textContent = 'Loading OCR (needs internet)...';
+      worker = await Tesseract.createWorker('eng');   // change 'eng' for other languages
+    }
+    try { await navigator.wakeLock.request('screen'); } catch (e) {}
+    running = true;
+    $('btnStart').textContent = 'Stop';
+    loop();
+  } catch (e) { log('Start failed: ' + e.message); $('status').textContent = 'Error'; }
+};
+</script>
+</body>
+</html>
