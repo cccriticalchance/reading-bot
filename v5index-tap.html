@@ -1,0 +1,691 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reading Bot (Tap)</title>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<style>
+  :root { --bg: #111; --fg: #eee; --mut: #aaa; --panel: #1b1b1b; --ok: #7ddc8a; --warn: #f2c35b; --bad: #ff7b72; }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body { height: 100%; }
+  body { font-family: sans-serif; margin: 0; padding: 10px; background: var(--bg); color: var(--fg);
+         display: flex; flex-direction: column; height: 100dvh; overflow: hidden; }
+  #cam { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+
+  /* ---- always-visible top part ---- */
+  #preview { display: block; width: 100%; max-height: 26vh; object-fit: contain; background: #000; border-radius: 8px; }
+  #statusRow { display: flex; align-items: center; gap: 10px; margin: 6px 0 2px; }
+  #status { flex: 1; font-size: 20px; font-weight: bold; min-width: 0; }
+  .runBtn { width: auto; margin: 0; padding: 10px 18px; font-size: 16px; font-weight: bold; border: 0; border-radius: 10px;
+            background: #2e7d32; color: #fff; }
+  .runBtn.stop { background: #c62828; }
+  #timer, #lastLog { font-size: 13px; color: #ccc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #lastLog { color: var(--mut); }
+
+  /* ---- tab bar ---- */
+  #tabs { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 8px; }
+  #tabs button { width: 100%; margin: 0; min-height: 46px; padding: 6px 2px; font-size: 14px; line-height: 1.15;
+                 background: transparent; color: var(--fg); border: 2px solid var(--fg); border-radius: 14px; }
+  #tabs button.active { background: var(--fg); color: #111; font-weight: bold; }
+
+  /* ---- option list + panel ---- */
+  #main { display: flex; gap: 10px; flex: 1; min-height: 0; margin-top: 8px; }
+  #opts { flex: 0 0 36%; overflow-y: auto; display: flex; flex-direction: column; }
+  #opts button { width: 100%; margin: 0; padding: 10px 6px; text-align: left; font-size: 15px; background: none; color: #bbb;
+                 border: 0; border-left: 3px solid transparent; border-radius: 0; }
+  #opts button.sel { color: #fff; font-weight: bold; border-left-color: var(--fg); background: var(--panel); }
+  #panels { flex: 1; min-width: 0; overflow-y: auto; background: var(--panel); border-radius: 10px; padding: 10px; }
+
+  button:focus-visible, input:focus-visible { outline: 3px solid #6cb4ff; outline-offset: 2px; }
+  .act { display: block; width: 100%; margin: 6px 0; padding: 12px; font-size: 16px; background: transparent; color: var(--fg);
+         border: 2px solid var(--fg); border-radius: 10px; touch-action: manipulation; user-select: none; }
+  .act.main { background: var(--fg); color: #111; font-weight: bold; }
+  .act:disabled { opacity: .45; }
+  .big { font-size: 22px; padding: 18px 12px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .grid4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 4px; }
+  .grid4 .act, .grid .act { margin: 4px 0; padding: 10px 2px; }
+  label { display: block; font-size: 13px; margin-top: 8px; }
+  label:first-child { margin-top: 0; }
+  input[type=number] { width: 100%; font-size: 16px; padding: 8px; }
+  input[type=range] { width: 100%; padding: 0; }
+  .note { font-size: 12px; color: var(--mut); margin: 8px 0 0; line-height: 1.35; }
+  .readout { font-size: 14px; margin: 8px 0 0; text-align: center; }
+  pre { font-size: 11px; white-space: pre-wrap; background: #222; padding: 8px; border-radius: 6px; margin: 0; }
+  .result { margin-top: 10px; padding: 8px 10px; font-size: 13px; line-height: 1.4; white-space: pre-wrap; background: #222;
+            border-radius: 6px; border-left: 4px solid var(--mut); }
+  .result.ok { border-left-color: var(--ok); }
+  .result.warn { border-left-color: var(--warn); }
+  .result.bad { border-left-color: var(--bad); }
+</style>
+</head>
+<body>
+<video id="cam" autoplay playsinline muted></video>
+
+<!-- Always visible: what the camera reads, status, start/stop -->
+<canvas id="preview" width="640" height="360"></canvas>
+<div id="statusRow">
+  <div id="status">Ready</div>
+  <button id="btnStart" class="runBtn">Start</button>
+</div>
+<div id="timer">Reading timer: not running</div>
+<div id="lastLog"></div>
+
+<!-- Tabs -->
+<nav id="tabs" role="tablist">
+  <button role="tab" data-tab="camera">Camera</button>
+  <button role="tab" data-tab="time">Reading Time</button>
+  <button role="tab" data-tab="test">Test</button>
+  <button role="tab" data-tab="setting">Setting</button>
+</nav>
+
+<div id="main">
+  <div id="opts"></div>
+  <div id="panels">
+
+    <!-- ===== CAMERA ===== -->
+    <section data-panel="camera:cam">
+      <button id="btnCam" class="act main">Turn camera on</button>
+      <p class="note">Turn the camera on, then use Zoom to frame the page. The preview at the top shows exactly the area that is read.</p>
+    </section>
+
+    <section data-panel="camera:zoom">
+      <div id="hwZoomBox" style="display:none">
+        <label>Camera zoom: <span id="hwZoomVal">1.0x</span> (best quality)</label>
+        <input id="hwZoom" type="range" min="1" max="4" step="0.1" value="1">
+      </div>
+      <label>Crop zoom: <span id="dzVal">1.0x</span> (digital, crops what is read)</label>
+      <input id="dz" type="range" min="1" max="4" step="0.1" value="1">
+      <div class="grid4">
+        <button class="act" data-dz="1">1x</button>
+        <button class="act" data-dz="1.5">1.5x</button>
+        <button class="act" data-dz="2">2x</button>
+        <button class="act" data-dz="3">3x</button>
+      </div>
+    </section>
+
+    <section data-panel="camera:left">
+      <button class="act big" data-nudge="panX:-3">&#9664; Crop Left</button>
+      <div class="readout" id="panXVal"></div>
+      <p class="note cropHint"></p>
+      <p class="note">Tap, or hold to keep moving.</p>
+    </section>
+
+    <section data-panel="camera:right">
+      <button class="act big" data-nudge="panX:3">Crop Right &#9654;</button>
+      <div class="readout" id="panXVal2"></div>
+      <p class="note cropHint"></p>
+      <p class="note">Tap, or hold to keep moving.</p>
+    </section>
+
+    <section data-panel="camera:updown">
+      <div class="grid">
+        <button class="act big" data-nudge="panY:-3">&#9650; Up</button>
+        <button class="act big" data-nudge="panY:3">&#9660; Down</button>
+      </div>
+      <div class="readout" id="panYVal"></div>
+      <p class="note cropHint"></p>
+    </section>
+
+    <section data-panel="camera:reset">
+      <button id="btnZoomReset" class="act main">Reset zoom</button>
+      <p class="note">Puts crop zoom, crop position and camera zoom back to the start.</p>
+    </section>
+
+    <!-- hidden state for the crop position (changed by the Crop buttons) -->
+    <input id="panX" type="range" min="-100" max="100" step="1" value="0" hidden>
+    <input id="panY" type="range" min="-100" max="100" step="1" value="0" hidden>
+
+    <!-- ===== READING TIME ===== -->
+    <section data-panel="time:set">
+      <div class="grid">
+        <div><label>Hours</label><input id="hours" type="number" min="0" step="1" value="0"></div>
+        <div><label>Minutes</label><input id="minutes" type="number" min="0" step="1" value="0"></div>
+      </div>
+      <div class="grid4" style="grid-template-columns: repeat(3, 1fr);">
+        <button class="act" data-time="0:15">15 min</button>
+        <button class="act" data-time="0:30">30 min</button>
+        <button class="act" data-time="1:0">1 hour</button>
+        <button class="act" data-time="2:0">2 hours</button>
+        <button class="act" data-time="3:0">3 hours</button>
+        <button class="act" data-time="0:0">No limit</button>
+      </div>
+      <p class="note">The bot stops by itself when this time is up. Leave both at 0 for no limit. A change applies the next time you start.</p>
+    </section>
+
+    <section data-panel="time:start">
+      <button id="btnStart2" class="act main big runBtn" data-long="Start reading bot">Start reading bot</button>
+      <p class="note">Before you start: connect the Arduino (Test tab) and check the camera can read the page (Setting, Test Camera). The first start needs internet to load the reader.</p>
+    </section>
+
+    <!-- ===== TEST ===== -->
+    <section data-panel="test:ble">
+      <button id="btnBle" class="act main">Connect Arduino (Bluetooth)</button>
+      <div class="readout" id="bleState">Not connected</div>
+    </section>
+
+    <section data-panel="test:tap">
+      <button id="btnTest" class="act main big">Test tap</button>
+      <p class="note">Sends one tap to the Arduino. To also check that the page really turned, use Setting, Test Camera.</p>
+    </section>
+
+    <section data-panel="test:angle">
+      <div class="grid">
+        <button id="btnMinus" class="act big">Angle -</button>
+        <button id="btnPlus" class="act big">Angle +</button>
+      </div>
+    </section>
+
+    <section data-panel="test:rest">
+      <button id="btnRest" class="act main">Finger to rest</button>
+    </section>
+
+    <section data-panel="test:log">
+      <pre id="log"></pre>
+    </section>
+
+    <!-- ===== SETTING ===== -->
+    <section data-panel="setting:words">
+      <label>Words on a sparse page</label><input id="minW" type="number" value="20">
+      <label>Words on a full page</label><input id="maxW" type="number" value="300">
+    </section>
+
+    <section data-panel="setting:wait">
+      <label>Shortest wait (s)</label><input id="minT" type="number" value="10">
+      <label>Longest wait (s)</label><input id="maxT" type="number" value="45">
+    </section>
+
+    <section data-panel="setting:aftertap">
+      <label>Wait after tap (s)</label><input id="settle" type="number" value="2">
+      <label>Stop if the page does not change after this many taps (0 = off)</label>
+      <input id="maxSame" type="number" min="0" step="1" value="2">
+    </section>
+
+    <section data-panel="setting:testcam">
+      <button id="btnReadTest" class="act main">Read the page now</button>
+      <button id="btnTapCheck" class="act">Tap, then check the page turned</button>
+      <div id="testOut" class="result">Point the camera at a page and tap Read the page now. It shows if the words can be read.</div>
+      <p class="note">The tap check reads the page, sends one tap (needs the Arduino connected), waits your "Wait after tap" time, reads again, and compares the two pages.</p>
+    </section>
+
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const log = m => {
+  $('log').textContent = m + '\n' + $('log').textContent.slice(0, 1500);
+  $('lastLog').textContent = m;
+};
+
+let device = null, chr = null, worker = null, running = false, testing = false;
+
+if (!navigator.bluetooth) {
+  log('This browser has no Web Bluetooth. Use Chrome on Android (or Bluefy on iPhone).');
+}
+
+// ---------- Tabs and option list ----------
+const MENU = {
+  camera:  [['cam', 'Camera On'], ['zoom', 'Zoom'], ['left', 'Crop Left'], ['right', 'Crop Right'],
+            ['updown', 'Crop Up / Down'], ['reset', 'Reset Zoom']],
+  time:    [['set', 'Set Time'], ['start', 'Start Bot']],
+  test:    [['ble', 'Connect Arduino'], ['tap', 'Test Tap'], ['angle', 'Angle'], ['rest', 'Finger to Rest'], ['log', 'Log']],
+  setting: [['words', 'Words'], ['wait', 'Wait Time'], ['aftertap', 'After Tap'], ['testcam', 'Test Camera']]
+};
+let curTab = 'camera', menuOpen = true;
+const lastOpt = { camera: 'cam', time: 'set', test: 'ble', setting: 'words' };
+
+function renderMenu() {
+  document.querySelectorAll('#tabs button').forEach(b => {
+    const on = menuOpen && b.dataset.tab === curTab;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-selected', on);
+  });
+  $('main').hidden = !menuOpen;
+  const opts = $('opts');
+  opts.innerHTML = '';
+  MENU[curTab].forEach(([key, label]) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.classList.toggle('sel', key === lastOpt[curTab]);
+    b.onclick = () => { lastOpt[curTab] = key; renderMenu(); };
+    opts.appendChild(b);
+  });
+  const want = curTab + ':' + lastOpt[curTab];
+  document.querySelectorAll('[data-panel]').forEach(p => p.hidden = p.dataset.panel !== want);
+  $('panels').scrollTop = 0;
+}
+document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => {
+  if (menuOpen && curTab === b.dataset.tab) menuOpen = false;     // tap the open tab again to hide the menu
+  else { curTab = b.dataset.tab; menuOpen = true; }
+  renderMenu();
+});
+
+// ---------- Bluetooth (HM-10: service FFE0, characteristic FFE1) ----------
+const setBle = t => { $('bleState').textContent = t; };
+async function openGatt() {
+  const server = await device.gatt.connect();
+  const svc = await server.getPrimaryService(0xFFE0);
+  chr = await svc.getCharacteristic(0xFFE1);
+  try {                                        // show the Arduino's replies in the log
+    await chr.startNotifications();
+    chr.addEventListener('characteristicvaluechanged', e =>
+      log('Arduino: ' + new TextDecoder().decode(e.target.value).trim()));
+  } catch (e) { /* replies are optional */ }
+  setBle('Connected: ' + (device.name || 'unnamed'));
+}
+async function onDisconnected() {
+  chr = null;
+  setBle('Connection lost, reconnecting...');
+  log('Bluetooth lost, reconnecting...');
+  for (let i = 0; i < 5; i++) {
+    try { await openGatt(); log('Reconnected'); return; } catch (e) { await sleep(2000); }
+  }
+  setBle('Not connected');
+  log('Could not reconnect. Tap Connect Arduino again.');
+}
+async function connectBle() {
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      acceptAllDevices: true, optionalServices: [0xFFE0]
+    });
+    device.addEventListener('gattserverdisconnected', onDisconnected);
+    await openGatt();
+    log('Arduino connected: ' + (device.name || 'unnamed'));
+    $('status').textContent = 'Arduino connected';
+  } catch (e) { log('Bluetooth: ' + e.message); setBle('Not connected'); }
+}
+async function sendChar(ch) {
+  if (!chr) throw new Error('Arduino not connected');
+  const data = new TextEncoder().encode(ch);
+  if (chr.writeValueWithoutResponse) await chr.writeValueWithoutResponse(data);
+  else await chr.writeValue(data);
+}
+const sendFlip = () => sendChar('F');          // F = tap the key
+
+// ---------- Camera ----------
+let track = null, previewTimer = null;
+
+async function startCam() {
+  if ($('cam').srcObject) return;                  // already running
+  const base = { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } };
+  let stream;
+  try {                                            // ask for camera zoom control too
+    stream = await navigator.mediaDevices.getUserMedia({ video: { ...base, zoom: true }, audio: false });
+  } catch (e) {
+    stream = await navigator.mediaDevices.getUserMedia({ video: base, audio: false });
+  }
+  $('cam').srcObject = stream;
+  await $('cam').play();
+  setupHwZoom(stream.getVideoTracks()[0]);
+  if (!previewTimer) previewTimer = setInterval(drawPreview, 100);
+}
+
+function setupHwZoom(t) {                          // the phone camera's own zoom, if it has one
+  track = t;
+  let caps = {};
+  try { caps = t.getCapabilities ? t.getCapabilities() : {}; } catch (e) {}
+  if (!caps.zoom) { log('This phone does not offer camera zoom to the browser. Use crop zoom, or move the phone closer.'); return; }
+  const z = $('hwZoom');
+  z.min = caps.zoom.min; z.max = caps.zoom.max; z.step = caps.zoom.step || 0.1;
+  let cur = caps.zoom.min;
+  try { cur = t.getSettings().zoom || cur; } catch (e) {}
+  z.value = cur;
+  $('hwZoomVal').textContent = (+z.value).toFixed(1) + 'x';
+  $('hwZoomBox').style.display = 'block';
+  z.oninput = async () => {
+    $('hwZoomVal').textContent = (+z.value).toFixed(1) + 'x';
+    try { await track.applyConstraints({ advanced: [{ zoom: +z.value }] }); }
+    catch (e) { log('Zoom: ' + e.message); }
+  };
+}
+
+function cropRect() {                              // the part of the camera picture that is read
+  const v = $('cam'), vw = v.videoWidth, vh = v.videoHeight;
+  const z = +$('dz').value;
+  const w = vw / z, h = vh / z;
+  const mx = (vw - w) / 2, my = (vh - h) / 2;
+  return { x: mx + (+$('panX').value / 100) * mx,
+           y: my + (+$('panY').value / 100) * my, w: w, h: h };
+}
+function drawPreview() {
+  const v = $('cam'), p = $('preview');
+  if (!v.videoWidth) return;
+  const r = cropRect();
+  const w = 640, h = Math.round(640 * r.h / r.w);
+  if (p.width !== w || p.height !== h) { p.width = w; p.height = h; }
+  p.getContext('2d').drawImage(v, r.x, r.y, r.w, r.h, 0, 0, w, h);
+}
+function grab() {
+  const v = $('cam'), r = cropRect();
+  const scale = Math.max(1, Math.min(2, 1400 / r.w));   // enlarge small crops a little for OCR
+  const c = document.createElement('canvas');
+  c.width = Math.round(r.w * scale); c.height = Math.round(r.h * scale);
+  c.getContext('2d').drawImage(v, r.x, r.y, r.w, r.h, 0, 0, c.width, c.height);
+  return c;
+}
+
+// ---------- Measuring the page ----------
+async function ensureWorker() {
+  if (!worker) {
+    $('status').textContent = 'Loading OCR (needs internet)...';
+    worker = await Tesseract.createWorker('eng');   // change 'eng' for other languages
+  }
+  return worker;
+}
+async function countWords(canvas) {
+  const { data } = await worker.recognize(canvas);
+  const words = data.text.split(/\s+/).filter(t => (t.match(/[\p{L}\p{N}]/gu) || []).length >= 2);
+  const list = words.map(w => w.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '')).filter(w => w.length >= 2);
+  const flat = data.text.replace(/\s+/g, ' ').trim();
+  return { n: words.length, words: list, preview: flat.slice(0, 120), sample: flat.slice(0, 260) };
+}
+function inkPercent(canvas) {          // fallback for picture / blank pages
+  const w = 400, h = Math.round(canvas.height * w / canvas.width);
+  const s = document.createElement('canvas'); s.width = w; s.height = h;
+  const ctx = s.getContext('2d'); ctx.drawImage(canvas, 0, 0, w, h);
+  const d = ctx.getImageData(0, 0, w, h).data;
+  const g = new Uint8Array(w * h), hist = new Array(256).fill(0);
+  for (let i = 0; i < w * h; i++) {
+    const v = (d[4*i] * 0.299 + d[4*i+1] * 0.587 + d[4*i+2] * 0.114) | 0;
+    g[i] = v; hist[v]++;
+  }
+  let acc = 0, paper = 255;            // paper brightness = 90th percentile
+  for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= 0.9 * w * h) { paper = v; break; } }
+  let dark = 0;
+  for (let i = 0; i < w * h; i++) if (g[i] < paper * 0.6) dark++;
+  return 100 * dark / (w * h);
+}
+function waitSeconds(words, ink) {
+  const minW = +$('minW').value, maxW = +$('maxW').value;
+  const minT = +$('minT').value, maxT = +$('maxT').value;
+  let r = words >= 15 ? (words - minW) / (maxW - minW) : (ink - 2) / (12 - 2);
+  r = Math.max(0, Math.min(1, r));
+  return minT + r * (maxT - minT);
+}
+
+// ---------- Reading timer ----------
+let sessionEnd = null, timeUp = false, stopReason = '';
+let sameCount = 0, prevWords = null;
+const SAME_PAGE = 0.6;      // words in common (0 to 1) above which two pages count as the same
+const RETRY_S = 5;          // seconds to wait before tapping again when the page did not change
+function setRunLabel() {
+  document.querySelectorAll('.runBtn').forEach(b => {
+    b.textContent = running ? 'Stop' : (b.dataset.long || 'Start');
+    b.classList.toggle('stop', running);
+  });
+}
+function similarity(a, b) {  // share of distinct words that both pages have
+  const A = new Set(a), B = new Set(b);
+  let inter = 0;
+  A.forEach(w => { if (B.has(w)) inter++; });
+  const union = A.size + B.size - inter;
+  return union ? inter / union : 0;
+}
+function stopForSamePage(n) {
+  stopReason = 'Page did not change after ' + n + (n === 1 ? ' tap' : ' taps') + ', stopped';
+  timeUp = true; running = false; sessionEnd = null;      // timeUp keeps the message on screen
+  setRunLabel();
+  $('timer').textContent = stopReason;
+  log(stopReason + '. This may be the end of the book, or the tap is not working.');
+  try { if (navigator.vibrate) navigator.vibrate([300, 100, 300, 100, 300]); } catch (e) {}
+}
+function sessionMs() {
+  const h = Math.max(0, parseInt($('hours').value, 10) || 0);
+  const m = Math.max(0, parseInt($('minutes').value, 10) || 0);
+  return (h * 60 + m) * 60000;
+}
+function fmt(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s % 60;
+  return h + ':' + String(m).padStart(2, '0') + ':' + String(x).padStart(2, '0');
+}
+function finishSession() {
+  timeUp = true; running = false; sessionEnd = null; stopReason = 'Reading time finished';
+  setRunLabel();
+  $('timer').textContent = 'Reading time finished';
+  log('Reading time finished, the bot has stopped.');
+  try { if (navigator.vibrate) navigator.vibrate([300, 100, 300]); } catch (e) {}
+}
+function tickTimer() {
+  if (running && sessionEnd) {
+    const left = sessionEnd - Date.now();
+    if (left <= 0) { finishSession(); return; }
+    $('timer').textContent = 'Reading time left: ' + fmt(left);
+  } else if (running) {
+    $('timer').textContent = 'Reading timer: no limit';
+  } else if (!timeUp) {
+    $('timer').textContent = 'Reading timer: not running';
+  }
+}
+setInterval(tickTimer, 1000);
+
+// ---------- Main loop ----------
+async function loop() {
+  while (running) {
+    const t0 = Date.now();
+    $('status').textContent = 'Reading the page...';
+    const frame = grab();
+    const ink = inkPercent(frame);
+    let words = 0, preview = '', list = [];
+    try { const r = await countWords(frame); words = r.n; preview = r.preview; list = r.words; }
+    catch (e) { log('OCR error: ' + e.message); }
+
+    // did the last tap turn the page?
+    const maxSame = Math.max(0, parseInt($('maxSame').value, 10) || 0);
+    let retry = false;
+    if (maxSame > 0 && prevWords && list.length >= 15 && prevWords.length >= 15) {
+      const sim = similarity(prevWords, list);
+      if (sim >= SAME_PAGE) {
+        sameCount++;
+        log('Page looks unchanged after the tap (' + sameCount + ' of ' + maxSame + '), match ' + sim.toFixed(2));
+        if (sameCount >= maxSame) { stopForSamePage(sameCount); break; }
+        retry = true;
+      } else {
+        sameCount = 0;
+      }
+    } else {
+      sameCount = 0;                      // not enough text to compare
+    }
+    prevWords = list.length >= 15 ? list : null;
+
+    const target = retry ? RETRY_S : waitSeconds(words, ink);
+    log('words=' + words + ' ink=' + ink.toFixed(1) + '% -> wait ' + target.toFixed(0) + 's | ' + preview);
+
+    const end = t0 + target * 1000;     // OCR time counts toward the wait
+    while (running && Date.now() < end) {
+      $('status').textContent = 'Next page in ' + Math.ceil((end - Date.now()) / 1000) + ' s';
+      await sleep(250);
+    }
+    if (!running) break;
+    try { await sendFlip(); log('Tap sent'); } catch (e) { log('Tap failed: ' + e.message); }
+    $('status').textContent = 'Tapping...';
+    await sleep((+$('settle').value) * 1000);
+  }
+  $('status').textContent = stopReason || 'Stopped';
+  setRunLabel();
+}
+
+// ---------- Test camera (can it read the words?) and tap check ----------
+function showTest(text, cls) {
+  const o = $('testOut');
+  o.className = 'result' + (cls ? ' ' + cls : '');
+  o.textContent = text;
+}
+function setTestBusy(b) {
+  testing = b;
+  $('btnReadTest').disabled = b; $('btnTapCheck').disabled = b;
+}
+function blockedWhileRunning() {
+  if (!running) return false;
+  showTest('The bot is running. Stop it first, because the test would interfere with it.', 'bad');
+  return true;
+}
+async function readOnce() {                       // camera + OCR on the area shown in the preview
+  await startCam();
+  const v = $('cam');
+  for (let i = 0; i < 30 && !v.videoWidth; i++) await sleep(100);
+  if (!v.videoWidth) throw new Error('the camera gave no picture');
+  await ensureWorker();
+  const frame = grab();
+  const ink = inkPercent(frame);
+  const r = await countWords(frame);
+  $('status').textContent = 'Testing...';
+  return { ...r, ink };
+}
+async function runReadTest() {
+  if (blockedWhileRunning()) return;
+  setTestBusy(true);
+  try {
+    showTest('Reading the page...');
+    const r = await readOnce();
+    const good = r.words.length >= 15, weak = r.words.length >= 5;
+    let head, cls, tip = '';
+    if (good) { head = 'Good: the camera can read this page.'; cls = 'ok'; }
+    else if (weak) { head = 'Weak: only a few words were read.'; cls = 'warn'; }
+    else { head = 'Cannot read words.'; cls = 'bad'; }
+    if (!good) {
+      tip = r.ink < 1
+        ? '\nThe picture looks blank. Check that the camera points at the page.'
+        : '\nTry: zoom in on the text, move the phone closer, add light, hold it steady, or make sure the crop is not cutting the text off.';
+    }
+    showTest(head + '\nWords read: ' + r.n + '   Ink: ' + r.ink.toFixed(1) + '%' +
+             '\nWait the bot would use: ' + waitSeconds(r.n, r.ink).toFixed(0) + ' s' + tip +
+             (r.sample ? '\n\nText seen:\n' + r.sample : ''), cls);
+    $('status').textContent = good ? 'Camera can read the page' : 'Camera test done';
+  } catch (e) {
+    showTest('Camera test failed: ' + e.message, 'bad');
+    $('status').textContent = 'Error';
+  } finally { setTestBusy(false); }
+}
+async function runTapCheck() {
+  if (blockedWhileRunning()) return;
+  if (!chr) { showTest('The Arduino is not connected. Open the Test tab and connect it first.', 'bad'); return; }
+  setTestBusy(true);
+  try {
+    showTest('Step 1 of 3: reading the page...');
+    const a = await readOnce();
+    if (a.words.length < 15) {
+      showTest('Only ' + a.n + ' words were read, which is not enough to tell if the page turns.\nFix the reading first with Read the page now, then try again.', 'warn');
+      return;
+    }
+    showTest('Step 2 of 3: sending the tap...');
+    await sendFlip();
+    log('Test tap sent (page check)');
+    await sleep(Math.max(1, +$('settle').value || 2) * 1000);
+    showTest('Step 3 of 3: reading the page again...');
+    const b = await readOnce();
+    if (b.words.length < 15) {
+      showTest('The tap was sent, but the page after it has too few readable words (' + b.n + ') to compare.\nThe page may have turned to a picture or blank page. Check it by eye.', 'warn');
+      return;
+    }
+    const sim = similarity(a.words, b.words);
+    const pct = Math.round(sim * 100);
+    if (sim < SAME_PAGE) showTest('Page turned.\nThe two pages share only ' + pct + '% of their words.\nBefore: ' + a.n + ' words. After: ' + b.n + ' words.', 'ok');
+    else showTest('The page did not change.\nThe two reads share ' + pct + '% of their words.\nCheck the finger position (Test, Angle) and that it touches the key. This could also be the last page.', 'bad');
+  } catch (e) {
+    showTest('Tap check failed: ' + e.message, 'bad');
+  } finally { setTestBusy(false); $('status').textContent = 'Ready'; }
+}
+
+// ---------- Buttons ----------
+$('btnBle').onclick = connectBle;
+$('btnCam').onclick = async () => {
+  try { await startCam(); $('status').textContent = 'Camera on'; }
+  catch (e) { log('Camera: ' + e.message); }
+};
+document.querySelectorAll('[data-dz]').forEach(b => b.onclick = () => {
+  $('dz').value = b.dataset.dz; $('dz').dispatchEvent(new Event('input'));
+});
+document.querySelectorAll('[data-time]').forEach(b => b.onclick = () => {
+  const [h, m] = b.dataset.time.split(':');
+  $('hours').value = h; $('minutes').value = m;
+  $('hours').dispatchEvent(new Event('input'));
+});
+
+// crop buttons: tap to nudge, hold to keep moving
+function nudge(id, d) {
+  const el = $(id);
+  el.value = Math.max(-100, Math.min(100, (+el.value) + d));
+  el.dispatchEvent(new Event('input'));
+}
+document.querySelectorAll('[data-nudge]').forEach(b => {
+  const [id, d] = b.dataset.nudge.split(':');
+  let t = null;
+  const stop = () => { clearInterval(t); t = null; };
+  b.addEventListener('pointerdown', e => {
+    e.preventDefault(); stop();
+    nudge(id, +d);
+    t = setInterval(() => nudge(id, +d), 90);
+  });
+  ['pointerup', 'pointerleave', 'pointercancel'].forEach(ev => b.addEventListener(ev, stop));
+  b.addEventListener('contextmenu', e => e.preventDefault());
+});
+
+$('btnZoomReset').onclick = () => {
+  $('dz').value = 1; $('panX').value = 0; $('panY').value = 0;
+  $('dz').dispatchEvent(new Event('input'));
+  const z = $('hwZoom');
+  if ($('hwZoomBox').style.display !== 'none') { z.value = z.min; z.oninput(); }
+  log('Zoom reset');
+};
+
+// remember zoom and settings on this phone
+const SAVED = ['minW', 'maxW', 'minT', 'maxT', 'settle', 'maxSame', 'hours', 'minutes', 'dz', 'panX', 'panY'];
+function posText(v, neg, pos) { v = +v; return v === 0 ? 'centered' : Math.abs(v) + ' ' + (v < 0 ? neg : pos); }
+function updateZoomLabels() {
+  $('dzVal').textContent = (+$('dz').value).toFixed(1) + 'x';
+  $('panXVal').textContent = 'Crop position: ' + posText($('panX').value, 'left', 'right');
+  $('panXVal2').textContent = $('panXVal').textContent;
+  $('panYVal').textContent = 'Crop position: ' + posText($('panY').value, 'up', 'down');
+  const hint = +$('dz').value <= 1 ? 'Crop zoom is 1x, so there is nothing to move yet. Raise it in Zoom.' : '';
+  document.querySelectorAll('.cropHint').forEach(e => e.textContent = hint);
+}
+function saveSettings() {
+  try {
+    const d = {}; SAVED.forEach(id => d[id] = $(id).value);
+    localStorage.setItem('readingBotSettings', JSON.stringify(d));
+  } catch (e) {}
+}
+try {
+  const d = JSON.parse(localStorage.getItem('readingBotSettings') || '{}');
+  SAVED.forEach(id => { if (d[id] !== undefined) $(id).value = d[id]; });
+} catch (e) {}
+updateZoomLabels();
+SAVED.forEach(id => $(id).addEventListener('input', () => { updateZoomLabels(); saveSettings(); }));
+$('btnMinus').onclick = () => sendChar('-').catch(e => log(e.message));
+$('btnPlus').onclick = () => sendChar('+').catch(e => log(e.message));
+$('btnRest').onclick = () => sendChar('r').catch(e => log(e.message));
+$('btnTest').onclick = async () => {
+  try { await sendFlip(); log('Test tap sent'); } catch (e) { log(e.message); }
+};
+$('btnReadTest').onclick = runReadTest;
+$('btnTapCheck').onclick = runTapCheck;
+
+async function toggleRun() {
+  if (running) { running = false; sessionEnd = null; setRunLabel(); return; }
+  if (testing) { log('Wait for the camera test to finish, then start.'); return; }
+  try {
+    $('status').textContent = 'Starting camera...';
+    await startCam();
+    await ensureWorker();
+    try { await navigator.wakeLock.request('screen'); } catch (e) {}
+    const ms = sessionMs();
+    timeUp = false; stopReason = ''; sameCount = 0; prevWords = null;
+    sessionEnd = ms > 0 ? Date.now() + ms : null;    // 0 hours and 0 minutes = no limit
+    running = true;
+    setRunLabel();
+    tickTimer();
+    loop();
+  } catch (e) { log('Start failed: ' + e.message); $('status').textContent = 'Error'; }
+}
+document.querySelectorAll('.runBtn').forEach(b => b.onclick = toggleRun);
+
+setRunLabel();
+renderMenu();
+</script>
+</body>
+</html>
